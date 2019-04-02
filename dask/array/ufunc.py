@@ -6,9 +6,10 @@ from functools import partial, wraps
 import numpy as np
 from toolz import curry
 
-from .core import Array, elemwise, atop, apply_infer_dtype, asarray
+from .core import Array, elemwise, blockwise, apply_infer_dtype, asarray
 from ..base import is_dask_collection, normalize_function
-from .. import core, sharedict
+from .. import core
+from ..highlevelgraph import HighLevelGraph
 from ..utils import skip_doctest, funcname
 
 
@@ -109,9 +110,14 @@ class ufunc(object):
         return repr(self._ufunc)
 
     def __call__(self, *args, **kwargs):
-        dsk = [arg for arg in args if hasattr(arg, '_elemwise')]
-        if len(dsk) > 0:
-            return dsk[0]._elemwise(self._ufunc, *args, **kwargs)
+        dsks = [arg for arg in args if hasattr(arg, '_elemwise')]
+        if len(dsks) > 0:
+            for dsk in dsks:
+                result = dsk._elemwise(self._ufunc, *args, **kwargs)
+                if type(result) != type(NotImplemented):
+                    return result
+            raise TypeError("Parameters of such types "
+                            "are not supported by " + self.__name__)
         else:
             return self._ufunc(*args, **kwargs)
 
@@ -146,12 +152,19 @@ class ufunc(object):
         else:
             func = self._ufunc.outer
 
-        return atop(func, out_inds, A, A_inds, B, B_inds, dtype=dtype,
-                    token=self.__name__ + '.outer', **kwargs)
+        return blockwise(
+            func,
+            out_inds,
+            A, A_inds,
+            B, B_inds,
+            dtype=dtype,
+            token=self.__name__ + '.outer',
+            **kwargs
+        )
 
 
 # ufuncs, copied from this page:
-# http://docs.scipy.org/doc/numpy/reference/ufuncs.html
+# https://docs.scipy.org/doc/numpy/reference/ufuncs.html
 
 # math operations
 add = ufunc(np.add)
@@ -224,6 +237,7 @@ bitwise_and = ufunc(np.bitwise_and)
 bitwise_or = ufunc(np.bitwise_or)
 bitwise_xor = ufunc(np.bitwise_xor)
 bitwise_not = ufunc(np.bitwise_not)
+invert = bitwise_not
 
 # floating functions
 isfinite = ufunc(np.isfinite)
@@ -242,7 +256,7 @@ ceil = ufunc(np.ceil)
 trunc = ufunc(np.trunc)
 
 # more math routines, from this page:
-# http://docs.scipy.org/doc/numpy/reference/routines.math.html
+# https://docs.scipy.org/doc/numpy/reference/routines.math.html
 degrees = ufunc(np.degrees)
 radians = ufunc(np.radians)
 rint = ufunc(np.rint)
@@ -254,6 +268,8 @@ absolute = ufunc(np.absolute)
 clip = wrap_elemwise(np.clip)
 isreal = wrap_elemwise(np.isreal, array_wrap=True)
 iscomplex = wrap_elemwise(np.iscomplex, array_wrap=True)
+isneginf = wrap_elemwise(np.isneginf, array_wrap=True)
+isposinf = wrap_elemwise(np.isposinf, array_wrap=True)
 real = wrap_elemwise(np.real, array_wrap=True)
 imag = wrap_elemwise(np.imag, array_wrap=True)
 fix = wrap_elemwise(np.fix, array_wrap=True)
@@ -286,8 +302,10 @@ def frexp(x):
     ldt = l.dtype
     rdt = r.dtype
 
-    L = Array(sharedict.merge(tmp.dask, (left, ldsk)), left, chunks=tmp.chunks, dtype=ldt)
-    R = Array(sharedict.merge(tmp.dask, (right, rdsk)), right, chunks=tmp.chunks, dtype=rdt)
+    graph = HighLevelGraph.from_collections(left, ldsk, dependencies=[tmp])
+    L = Array(graph, left, chunks=tmp.chunks, dtype=ldt)
+    graph = HighLevelGraph.from_collections(right, rdsk, dependencies=[tmp])
+    R = Array(graph, right, chunks=tmp.chunks, dtype=rdt)
     return L, R
 
 
@@ -307,6 +325,8 @@ def modf(x):
     ldt = l.dtype
     rdt = r.dtype
 
-    L = Array(sharedict.merge(tmp.dask, (left, ldsk)), left, chunks=tmp.chunks, dtype=ldt)
-    R = Array(sharedict.merge(tmp.dask, (right, rdsk)), right, chunks=tmp.chunks, dtype=rdt)
+    graph = HighLevelGraph.from_collections(left, ldsk, dependencies=[tmp])
+    L = Array(graph, left, chunks=tmp.chunks, dtype=ldt)
+    graph = HighLevelGraph.from_collections(right, rdsk, dependencies=[tmp])
+    R = Array(graph, right, chunks=tmp.chunks, dtype=rdt)
     return L, R

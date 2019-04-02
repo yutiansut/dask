@@ -56,10 +56,10 @@ except AttributeError:
 unary_ufuncs = ['absolute', 'arccos', 'arccosh', 'arcsin', 'arcsinh', 'arctan',
                 'arctanh', 'bitwise_not', 'cbrt', 'ceil', 'conj', 'cos',
                 'cosh', 'deg2rad', 'degrees', 'exp', 'exp2', 'expm1', 'fabs',
-                'fix', 'floor', 'i0', 'isfinite', 'isinf', 'isnan', 'log',
-                'log10', 'log1p', 'log2', 'logical_not', 'nan_to_num',
+                'fix', 'floor', 'invert','isfinite', 'isinf', 'isnan', 'log',
+                'log10', 'log1p', 'log2', 'logical_not',
                 'negative', 'rad2deg', 'radians', 'reciprocal', 'rint', 'sign',
-                'signbit', 'sin', 'sinc', 'sinh', 'spacing', 'sqrt', 'square',
+                'signbit', 'sin', 'sinh', 'spacing', 'sqrt', 'square',
                 'tan', 'tanh', 'trunc']
 
 
@@ -268,6 +268,25 @@ def test_angle():
     assert_eq(da.angle(comp), np.angle(comp))
 
 
+def test_issignedinf():
+    arr = np.random.randint(-1, 2, size=(20, 20)).astype(float) / 0
+    darr = da.from_array(arr, 3)
+
+    assert_eq(np.isneginf(arr), da.isneginf(darr))
+    assert_eq(np.isposinf(arr), da.isposinf(darr))
+
+
+@pytest.mark.parametrize('func', ['i0', 'sinc', 'nan_to_num'])
+def test_non_ufunc_others(func):
+    arr = np.random.randint(1, 100, size=(20, 20))
+    darr = da.from_array(arr, 3)
+
+    dafunc = getattr(da, func)
+    npfunc = getattr(np, func)
+
+    assert_eq(dafunc(darr), npfunc(arr), equal_nan=True)
+
+
 def test_frompyfunc():
     myadd = da.frompyfunc(add, 2, 1)
     np_myadd = np.frompyfunc(add, 2, 1)
@@ -365,3 +384,11 @@ def test_out_numpy():
 
     assert 'ndarray' in str(info.value)
     assert 'Array' in str(info.value)
+
+
+@pytest.mark.skipif(np.__version__ < '1.13.0', reason='array_ufunc not present')
+def test_out_shape_mismatch():
+    x = da.arange(10, chunks=(5,))
+    y = da.arange(15, chunks=(5,))
+    with pytest.raises(ValueError):
+        assert np.log(x, out=y)

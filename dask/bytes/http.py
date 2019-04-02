@@ -8,7 +8,7 @@ from . import core
 DEFAULT_BLOCK_SIZE = 5 * 2 ** 20
 
 
-class HTTPFileSystem(core.FileSystem):
+class HTTPFileSystem(object):
     """
     Simple File-System for fetching data via HTTP(S)
 
@@ -21,9 +21,12 @@ class HTTPFileSystem(core.FileSystem):
         """
         Parameters
         ----------
+        block_size: int
+            Blocks to read bytes; if 0, will default to raw requests file-like
+            objects instead of HTTPFile instances
         storage_options: key-value
             May be credentials, e.g., `{'auth': ('username', 'pword')}` or any
-            other parameters for requests
+            other parameters passed on to requests
         """
         self.block_size = storage_options.pop('block_size', DEFAULT_BLOCK_SIZE)
         self.kwargs = storage_options
@@ -52,7 +55,15 @@ class HTTPFileSystem(core.FileSystem):
         if mode != 'rb':
             raise NotImplementedError
         block_size = block_size if block_size is not None else self.block_size
-        return HTTPFile(url, self.session, block_size, **self.kwargs)
+        if block_size:
+            return HTTPFile(url, self.session, block_size, **self.kwargs)
+        else:
+            kw = self.kwargs.copy()
+            kw['stream'] = True
+            r = self.session.get(url, **kw)
+            r.raise_for_status()
+            r.raw.decode_content = True
+            return r.raw
 
     def ukey(self, url):
         """Unique identifier, implied file might have changed every time"""
@@ -85,7 +96,7 @@ class HTTPFile(object):
         connections where the server allows this
     block_size: int or None
         The amount of read-ahead to do, in bytes. Default is 5MB, or the value
-        configured for the FileSystem creating this file
+        configured for the FileSystem creating this file.
     kwargs: all other key-values are passed to reqeuests calls.
     """
 
@@ -150,16 +161,26 @@ class HTTPFile(object):
             file. If the server has not supplied the filesize, attempting to
             read only part of the data will raise a ValueError.
         """
+        if length == 0:
+            # asked for no data, so supply no data and shortcut doing work
+            return b''
         if self.size is None:
             if length >= 0:
+                # asked for specific amount of data, but we don't know how
+                # much is available
                 raise ValueError('File size is unknown, must read all data')
             else:
+                # asked for whole file
                 return self._fetch_all()
+        if length < 0 and self.loc == 0:
+            # size was provided, but asked for whole file, so shortcut
+            return self._fetch_all()
         if length < 0 or self.loc + length > self.size:
             end = self.size
         else:
             end = self.loc + length
         if self.loc >= self.size:
+            # EOF (python files don't error, just return no data)
             return b''
         self. _fetch(self.loc, end)
         data = self.cache[self.loc - self.start:end - self.start]
@@ -197,12 +218,22 @@ class HTTPFile(object):
     def _fetch_all(self):
         """Read whole file in one shot, without caching
 
-        This is only called when size is None and read() is called without a
-        byte-count.
+        This is only called when size is None or position is still at zero,
+        and read() is called without a byte-count.
         """
         r = self.session.get(self.url, **self.kwargs)
         r.raise_for_status()
-        return r.content
+        out = r.content
+        # set position to end of data; actually expect file might close shortly
+        l = len(out)
+        if l < self.blocksize:
+            # actually all data fits in one block, so cache
+            self.start = 0
+            self.end = l
+            self.cache = out
+            self.size = l
+        self.loc = len(out)
+        return out
 
     def _fetch_range(self, start, end):
         """Download a block of data
@@ -213,7 +244,7 @@ class HTTPFile(object):
         requested, an exception is raised.
         """
         kwargs = self.kwargs.copy()
-        headers = self.kwargs.pop('headers', {})
+        headers = kwargs.pop('headers', {})
         headers['Range'] = 'bytes=%i-%i' % (start, end - 1)
         r = self.session.get(self.url, headers=headers, stream=True, **kwargs)
         r.raise_for_status()
@@ -274,8 +305,17 @@ class HTTPFile(object):
 
 
 def file_size(url, session, **kwargs):
-    """Call HEAD on the server to get file size"""
-    r = session.head(url, **kwargs)
+    """Call HEAD on the server to get file size
+
+    Default operation is to explicitly allow redirects and use encoding
+    'identity' (no compression) to get the true size of the target.
+    """
+    kwargs = kwargs.copy()
+    ar = kwargs.pop('allow_redirects', True)
+    head = kwargs.get('headers', {})
+    if 'Accept-Encoding' not in head:
+        head['Accept-Encoding'] = 'identity'
+    r = session.head(url, allow_redirects=ar, **kwargs)
     r.raise_for_status()
     if 'Content-Length' in r.headers:
         return int(r.headers['Content-Length'])

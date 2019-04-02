@@ -1,27 +1,31 @@
 from __future__ import division, print_function, absolute_import
 
 import inspect
+import math
 import warnings
-from collections import Iterable
 from distutils.version import LooseVersion
 from functools import wraps, partial
-from itertools import product
-from numbers import Integral
-from operator import getitem
+from numbers import Real, Integral
 
 import numpy as np
 from toolz import concat, sliding_window, interleave
 
-from .. import sharedict
+from ..compatibility import Iterable
 from ..core import flatten
 from ..base import tokenize
-from . import numpy_compat, chunk
-from .creation import arange
+from ..highlevelgraph import HighLevelGraph
+from ..utils import funcname
+from . import chunk
+from .creation import arange, diag, empty, indices
+from .utils import safe_wraps, validate_axis
 from .wrap import ones
+from .ufunc import multiply, sqrt
 
 from .core import (Array, map_blocks, elemwise, from_array, asarray,
-                   asanyarray, concatenate, stack, atop, broadcast_shapes,
+                   asanyarray, concatenate, stack, blockwise, broadcast_shapes,
                    is_scalar_for_elemwise, broadcast_to, tensordot_lookup)
+
+from .einsumfuncs import einsum  # noqa
 
 
 @wraps(np.array)
@@ -94,23 +98,23 @@ def atleast_1d(*arys):
 
 
 @wraps(np.vstack)
-def vstack(tup):
+def vstack(tup, allow_unknown_chunksizes=False):
     tup = tuple(atleast_2d(x) for x in tup)
-    return concatenate(tup, axis=0)
+    return concatenate(tup, axis=0, allow_unknown_chunksizes=allow_unknown_chunksizes)
 
 
 @wraps(np.hstack)
-def hstack(tup):
+def hstack(tup, allow_unknown_chunksizes=False):
     if all(x.ndim == 1 for x in tup):
-        return concatenate(tup, axis=0)
+        return concatenate(tup, axis=0, allow_unknown_chunksizes=allow_unknown_chunksizes)
     else:
-        return concatenate(tup, axis=1)
+        return concatenate(tup, axis=1, allow_unknown_chunksizes=allow_unknown_chunksizes)
 
 
 @wraps(np.dstack)
-def dstack(tup):
+def dstack(tup, allow_unknown_chunksizes=False):
     tup = tuple(atleast_3d(x) for x in tup)
-    return concatenate(tup, axis=2)
+    return concatenate(tup, axis=2, allow_unknown_chunksizes=allow_unknown_chunksizes)
 
 
 @wraps(np.swapaxes)
@@ -125,8 +129,7 @@ def swapaxes(a, axis1, axis2):
     out = list(ind)
     out[axis1], out[axis2] = axis2, axis1
 
-    return atop(np.swapaxes, out, a, ind, axis1=axis1, axis2=axis2,
-                dtype=a.dtype)
+    return blockwise(np.swapaxes, out, a, ind, axis1=axis1, axis2=axis2, dtype=a.dtype)
 
 
 @wraps(np.transpose)
@@ -137,8 +140,8 @@ def transpose(a, axes=None):
     else:
         axes = tuple(range(a.ndim))[::-1]
     axes = tuple(d + a.ndim if d < 0 else d for d in axes)
-    return atop(np.transpose, axes, a, tuple(range(a.ndim)),
-                dtype=a.dtype, axes=axes)
+    return blockwise(np.transpose, axes, a, tuple(range(a.ndim)),
+                     dtype=a.dtype, axes=axes)
 
 
 def flip(m, axis):
@@ -186,7 +189,16 @@ ALPHABET = alphabet.upper()
 def _tensordot(a, b, axes):
     x = max([a, b], key=lambda x: x.__array_priority__)
     tensordot = tensordot_lookup.dispatch(type(x))
-    x = tensordot(a, b, axes=axes)
+
+    # workaround may be removed when numpy version (currently 1.13.0) is bumped
+    a_dims = np.array([a.shape[i] for i in axes[0]])
+    b_dims = np.array([b.shape[i] for i in axes[1]])
+    if len(a_dims) > 0 and (a_dims == b_dims).all() and a_dims.min() == 0:
+        x = np.zeros(tuple([s for i, s in enumerate(a.shape) if i not in axes[0]] +
+                           [s for i, s in enumerate(b.shape) if i not in axes[1]]))
+    else:
+        x = tensordot(a, b, axes=axes)
+
     ind = [slice(None, None)] * x.ndim
     for a in sorted(axes[0]):
         ind.insert(a, None)
@@ -202,9 +214,9 @@ def tensordot(lhs, rhs, axes=2):
         left_axes = tuple(range(lhs.ndim - 1, lhs.ndim - axes - 1, -1))
         right_axes = tuple(range(0, axes))
 
-    if isinstance(left_axes, int):
+    if isinstance(left_axes, Integral):
         left_axes = (left_axes,)
-    if isinstance(right_axes, int):
+    if isinstance(right_axes, Integral):
         right_axes = (right_axes,)
     if isinstance(left_axes, list):
         left_axes = tuple(left_axes)
@@ -213,18 +225,18 @@ def tensordot(lhs, rhs, axes=2):
 
     dt = np.promote_types(lhs.dtype, rhs.dtype)
 
-    left_index = list(alphabet[:lhs.ndim])
-    right_index = list(ALPHABET[:rhs.ndim])
+    left_index = list(range(lhs.ndim))
+    right_index = list(range(lhs.ndim, lhs.ndim + rhs.ndim))
     out_index = left_index + right_index
 
     for l, r in zip(left_axes, right_axes):
         out_index.remove(right_index[r])
         right_index[r] = left_index[l]
 
-    intermediate = atop(_tensordot, out_index,
-                        lhs, left_index,
-                        rhs, right_index, dtype=dt,
-                        axes=(left_axes, right_axes))
+    intermediate = blockwise(_tensordot, out_index,
+                             lhs, left_index,
+                             rhs, right_index, dtype=dt,
+                             axes=(left_axes, right_axes))
 
     result = intermediate.sum(axis=left_axes)
     return result
@@ -240,17 +252,7 @@ def vdot(a, b):
     return dot(a.conj().ravel(), b.ravel())
 
 
-def _inner_apply_along_axis(arr,
-                            func1d,
-                            func1d_axis,
-                            func1d_args,
-                            func1d_kwargs):
-    return np.apply_along_axis(
-        func1d, func1d_axis, arr, *func1d_args, **func1d_kwargs
-    )
-
-
-@wraps(np.matmul)
+@safe_wraps(np.matmul)
 def matmul(a, b):
     a = asanyarray(a)
     b = asanyarray(b)
@@ -273,7 +275,7 @@ def matmul(a, b):
     elif a.ndim > b.ndim:
         b = b[(a.ndim - b.ndim) * (np.newaxis,)]
 
-    out = atop(
+    out = blockwise(
         np.matmul, tuple(range(1, a.ndim + 1)),
         a, tuple(range(1, a.ndim - 1)) + (a.ndim - 1, 0,),
         b, tuple(range(1, a.ndim - 1)) + (0, a.ndim,),
@@ -287,6 +289,26 @@ def matmul(a, b):
         out = out[..., 0]
 
     return out
+
+
+@wraps(np.outer)
+def outer(a, b):
+    a = a.flatten()
+    b = b.flatten()
+
+    dtype = np.outer(a.dtype.type(), b.dtype.type()).dtype
+
+    return blockwise(np.outer, "ij", a, "i", b, "j", dtype=dtype)
+
+
+def _inner_apply_along_axis(arr,
+                            func1d,
+                            func1d_axis,
+                            func1d_args,
+                            func1d_kwargs):
+    return np.apply_along_axis(
+        func1d, func1d_axis, arr, *func1d_args, **func1d_kwargs
+    )
 
 
 @wraps(np.apply_along_axis)
@@ -303,10 +325,10 @@ def apply_along_axis(func1d, axis, arr, *args, **kwargs):
 
     if (LooseVersion(np.__version__) < LooseVersion("1.13.0") and
             (np.array(test_result.shape) > 1).sum(dtype=int) > 1):
-            raise ValueError(
-                "No more than one non-trivial dimension allowed in result. "
-                "Need NumPy 1.13.0+ for this functionality."
-            )
+        raise ValueError(
+            "No more than one non-trivial dimension allowed in result. "
+            "Need NumPy 1.13.0+ for this functionality."
+        )
 
     # Rechunk so that func1d is applied over the full axis.
     arr = arr.rechunk(
@@ -317,7 +339,7 @@ def apply_along_axis(func1d, axis, arr, *args, **kwargs):
     # Adds other axes as needed.
     result = arr.map_blocks(
         _inner_apply_along_axis,
-        token="apply_along_axis",
+        name=funcname(func1d) + '-along-axis',
         dtype=test_result.dtype,
         chunks=(arr.chunks[:axis] + test_result.shape + arr.chunks[axis + 1:]),
         drop_axis=axis,
@@ -403,6 +425,104 @@ def ediff1d(ary, to_end=None, to_begin=None):
     return r
 
 
+def _gradient_kernel(x, block_id, coord, axis, array_locs, grad_kwargs):
+    """
+    x: nd-array
+        array of one block
+    coord: 1d-array or scalar
+        coordinate along which the gradient is computed.
+    axis: int
+        axis along which the gradient is computed
+    array_locs:
+        actual location along axis. None if coordinate is scalar
+    grad_kwargs:
+        keyword to be passed to np.gradient
+    """
+    block_loc = block_id[axis]
+    if array_locs is not None:
+        coord = coord[array_locs[0][block_loc]:array_locs[1][block_loc]]
+    grad = np.gradient(x, coord, axis=axis, **grad_kwargs)
+    return grad
+
+
+@wraps(np.gradient)
+def gradient(f, *varargs, **kwargs):
+    f = asarray(f)
+
+    kwargs["edge_order"] = math.ceil(kwargs.get("edge_order", 1))
+    if kwargs["edge_order"] > 2:
+        raise ValueError("edge_order must be less than or equal to 2.")
+
+    drop_result_list = False
+    axis = kwargs.pop("axis", None)
+    if axis is None:
+        axis = tuple(range(f.ndim))
+    elif isinstance(axis, Integral):
+        drop_result_list = True
+        axis = (axis,)
+
+    axis = validate_axis(axis, f.ndim)
+
+    if len(axis) != len(set(axis)):
+        raise ValueError("duplicate axes not allowed")
+
+    axis = tuple(ax % f.ndim for ax in axis)
+
+    if varargs == ():
+        varargs = (1,)
+    if len(varargs) == 1:
+        varargs = len(axis) * varargs
+    if len(varargs) != len(axis):
+        raise TypeError(
+            "Spacing must either be a single scalar, or a scalar / 1d-array "
+            "per axis"
+        )
+
+    if issubclass(f.dtype.type, (np.bool8, Integral)):
+        f = f.astype(float)
+    elif issubclass(f.dtype.type, Real) and f.dtype.itemsize < 4:
+        f = f.astype(float)
+
+    results = []
+    for i, ax in enumerate(axis):
+        for c in f.chunks[ax]:
+            if np.min(c) < kwargs["edge_order"] + 1:
+                raise ValueError(
+                    'Chunk size must be larger than edge_order + 1. '
+                    'Minimum chunk for aixs {} is {}. Rechunk to '
+                    'proceed.'.format(np.min(c), ax))
+
+        if np.isscalar(varargs[i]):
+            array_locs = None
+        else:
+            if isinstance(varargs[i], Array):
+                raise NotImplementedError(
+                    'dask array coordinated is not supported.')
+            # coordinate position for each block taking overlap into account
+            chunk = np.array(f.chunks[ax])
+            array_loc_stop = np.cumsum(chunk) + 1
+            array_loc_start = array_loc_stop - chunk - 2
+            array_loc_stop[-1] -= 1
+            array_loc_start[0] = 0
+            array_locs = (array_loc_start, array_loc_stop)
+
+        results.append(f.map_overlap(
+            _gradient_kernel,
+            dtype=f.dtype,
+            depth={j: 1 if j == ax else 0 for j in range(f.ndim)},
+            boundary="none",
+            coord=varargs[i],
+            axis=ax,
+            array_locs=array_locs,
+            grad_kwargs=kwargs,
+        ))
+
+    if drop_result_list:
+        results = results[0]
+
+    return results
+
+
 @wraps(np.bincount)
 def bincount(x, weights=None, minlength=None):
     if minlength is None:
@@ -429,11 +549,9 @@ def bincount(x, weights=None, minlength=None):
 
     chunks = ((minlength,),)
 
-    dsk = sharedict.merge((name, dsk), x.dask)
-    if weights is not None:
-        dsk.update(weights.dask)
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[x] if weights is None else [x, weights])
 
-    return Array(dsk, name, chunks, dtype)
+    return Array(graph, name, chunks, dtype)
 
 
 @wraps(np.digitize)
@@ -480,9 +598,10 @@ def histogram(a, bins=None, range=None, normed=False, weights=None, density=None
     >>> h.compute()
     array([5000, 5000])
     """
-    if bins is None or (range is None and bins is None):
-        raise ValueError('dask.array.histogram requires either bins '
-                         'or bins and range to be defined.')
+    if not np.iterable(bins) and (range is None or bins is None):
+        raise ValueError('dask.array.histogram requires either specifying '
+                         'bins as an iterable or specifying both a range and '
+                         'the number of bins')
 
     if weights is not None and weights.chunks != a.chunks:
         raise ValueError('Input array and weights must have the same '
@@ -506,25 +625,23 @@ def histogram(a, bins=None, range=None, normed=False, weights=None, density=None
     name = 'histogram-sum-' + token
 
     # Map the histogram to all bins
-    def block_hist(x, weights=None):
-        return np.histogram(x, bins, weights=weights)[0][np.newaxis]
+    def block_hist(x, range=None, weights=None):
+        return np.histogram(x, bins, range=range, weights=weights)[0][np.newaxis]
 
     if weights is None:
-        dsk = {(name, i, 0): (block_hist, k)
+        dsk = {(name, i, 0): (block_hist, k, range)
                for i, k in enumerate(flatten(a.__dask_keys__()))}
         dtype = np.histogram([])[0].dtype
     else:
         a_keys = flatten(a.__dask_keys__())
         w_keys = flatten(weights.__dask_keys__())
-        dsk = {(name, i, 0): (block_hist, k, w)
+        dsk = {(name, i, 0): (block_hist, k, range, w)
                for i, (k, w) in enumerate(zip(a_keys, w_keys))}
         dtype = weights.dtype
 
-    all_dsk = sharedict.merge(a.dask, (name, dsk))
-    if weights is not None:
-        all_dsk.update(weights.dask)
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[a] if weights is None else [a, weights])
 
-    mapped = Array(all_dsk, name, chunks, dtype=dtype)
+    mapped = Array(graph, name, chunks, dtype=dtype)
     n = mapped.sum(axis=0)
 
     # We need to replicate normed and density options from numpy
@@ -594,10 +711,6 @@ def cov(m, y=None, rowvar=1, bias=0, ddof=None):
 
 @wraps(np.corrcoef)
 def corrcoef(x, y=None, rowvar=1):
-
-    from .ufunc import sqrt
-    from .creation import diag
-
     c = cov(x, y, rowvar)
     if c.shape == ():
         return c / c
@@ -631,12 +744,12 @@ def _unique_internal(ar, indices, counts, return_inverse=False):
     inverse mapping in Dask.
 
     Given Dask likes to have one array returned from functions like
-    ``atop``, some formatting is done to stuff all of the resulting arrays
+    ``blockwise``, some formatting is done to stuff all of the resulting arrays
     into one big NumPy structured array. Dask is then able to handle this
-    object and can split it apart into the separate results on the Dask
-    side, which then can be passed back to this function in concatenated
-    chunks for further reduction or can be return to the user to perform
-    other forms of analysis.
+    object and can split it apart into the separate results on the Dask side,
+    which then can be passed back to this function in concatenated chunks for
+    further reduction or can be return to the user to perform other forms of
+    analysis.
 
     By handling the problem in this way, it does not matter where a chunk
     is in a larger array or how big it is. The chunk can still be computed
@@ -699,7 +812,7 @@ def unique(ar, return_index=False, return_inverse=False, return_counts=False):
     else:
         args.extend([None, None])
 
-    out = atop(
+    out = blockwise(
         _unique_internal, "i",
         *args,
         dtype=out_dtype,
@@ -746,15 +859,10 @@ def unique(ar, return_index=False, return_inverse=False, return_counts=False):
     if return_counts:
         out_dtype.append(("counts", np.intp))
 
-    out = Array(
-        sharedict.merge(*(
-            [(name, dsk)] +
-            [o.dask for o in out_parts if hasattr(o, "__dask_keys__")]
-        )),
-        name,
-        ((np.nan,),),
-        out_dtype
-    )
+    dependencies = [o for o in out_parts if hasattr(o, '__dask_keys__')]
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=dependencies)
+    chunks = ((np.nan,),)
+    out = Array(graph, name, chunks, out_dtype)
 
     # Split out all results to return to the user.
 
@@ -778,6 +886,36 @@ def unique(ar, return_index=False, return_inverse=False, return_counts=False):
     else:
         result = tuple(result)
 
+    return result
+
+
+def _isin_kernel(element, test_elements, assume_unique=False):
+    values = np.in1d(element.ravel(), test_elements,
+                     assume_unique=assume_unique)
+    return values.reshape(element.shape + (1,) * test_elements.ndim)
+
+
+@safe_wraps(getattr(np, 'isin', None))
+def isin(element, test_elements, assume_unique=False, invert=False):
+    element = asarray(element)
+    test_elements = asarray(test_elements)
+    element_axes = tuple(range(element.ndim))
+    test_axes = tuple(i + element.ndim for i in range(test_elements.ndim))
+    mapped = blockwise(
+        _isin_kernel,
+        element_axes + test_axes,
+        element,
+        element_axes,
+        test_elements,
+        test_axes,
+        adjust_chunks={axis: lambda _: 1 for axis in test_axes},
+        dtype=bool,
+        assume_unique=assume_unique
+    )
+
+    result = mapped.any(axis=test_axes)
+    if invert:
+        result = ~result
     return result
 
 
@@ -836,105 +974,58 @@ def ravel(array):
 
 @wraps(np.squeeze)
 def squeeze(a, axis=None):
-    if 1 not in a.shape:
-        return a
     if axis is None:
         axis = tuple(i for i, d in enumerate(a.shape) if d == 1)
-    b = a.map_blocks(partial(np.squeeze, axis=axis), dtype=a.dtype)
-    chunks = tuple(bd for bd in b.chunks if bd != (1,))
+    elif not isinstance(axis, tuple):
+        axis = (axis,)
 
-    name = 'squeeze-' + tokenize(a, axis)
-    old_keys = list(product([b.name], *[range(len(bd)) for bd in b.chunks]))
-    new_keys = list(product([name], *[range(len(bd)) for bd in chunks]))
+    if any(a.shape[i] != 1 for i in axis):
+        raise ValueError("cannot squeeze axis with size other than one")
 
-    dsk = {n: b.dask[o] for o, n in zip(old_keys, new_keys)}
+    axis = validate_axis(axis, a.ndim)
 
-    return Array(sharedict.merge(b.dask, (name, dsk)), name, chunks, dtype=a.dtype)
+    sl = tuple(0 if i in axis else slice(None) for i, s in enumerate(a.shape))
 
-
-def topk(k, x):
-    """ The top k elements of an array
-
-    Returns the k greatest elements of the array in sorted order.  Only works
-    on arrays of a single dimension.
-
-    This assumes that ``k`` is small.  All results will be returned in a single
-    chunk.
-
-    Examples
-    --------
-
-    >>> x = np.array([5, 1, 3, 6])
-    >>> d = from_array(x, chunks=2)
-    >>> d.topk(2).compute()
-    array([6, 5])
-    """
-    if x.ndim != 1:
-        raise ValueError("Topk only works on arrays of one dimension")
-
-    token = tokenize(k, x)
-    name = 'chunk.topk-' + token
-    dsk = {(name, i): (chunk.topk, k, key)
-           for i, key in enumerate(x.__dask_keys__())}
-    name2 = 'topk-' + token
-    dsk[(name2, 0)] = (getitem, (np.sort, (np.concatenate, list(dsk))),
-                       slice(-1, -k - 1, -1))
-    chunks = ((k,),)
-
-    return Array(sharedict.merge((name2, dsk), x.dask), name2, chunks, dtype=x.dtype)
+    return a[sl]
 
 
 @wraps(np.compress)
 def compress(condition, a, axis=None):
-    if axis is None:
-        a = a.ravel()
-        axis = 0
-    if not -a.ndim <= axis < a.ndim:
-        raise ValueError('axis=(%s) out of bounds' % axis)
-    if axis < 0:
-        axis += a.ndim
+    condition = asarray(condition).astype(bool)
+    a = asarray(a)
 
-    # Only coerce non-lazy values to numpy arrays
-    if not isinstance(condition, Array):
-        condition = np.array(condition, dtype=bool)
     if condition.ndim != 1:
         raise ValueError("Condition must be one dimensional")
 
-    if isinstance(condition, Array):
-        if len(condition) < a.shape[axis]:
-            a = a[tuple(slice(None, len(condition))
-                        if i == axis else slice(None)
-                        for i in range(a.ndim))]
-        inds = tuple(range(a.ndim))
-        out = atop(np.compress, inds, condition, (inds[axis],), a, inds,
-                   axis=axis, dtype=a.dtype)
-        out._chunks = tuple((np.NaN,) * len(c) if i == axis else c
-                            for i, c in enumerate(out.chunks))
-        return out
-    else:
-        # Optimized case when condition is known
-        if len(condition) < a.shape[axis]:
-            condition = condition.copy()
-            condition.resize(a.shape[axis])
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    axis = validate_axis(axis, a.ndim)
 
-        slc = ((slice(None),) * axis + (condition, ) +
-               (slice(None),) * (a.ndim - axis - 1))
-        return a[slc]
+    # Treat `condition` as filled with `False` (if it is too short)
+    a = a[tuple(slice(None, len(condition))
+                if i == axis else slice(None)
+                for i in range(a.ndim))]
+
+    # Use `condition` to select along 1 dimension
+    a = a[tuple(condition
+                if i == axis else slice(None)
+                for i in range(a.ndim))]
+
+    return a
 
 
 @wraps(np.extract)
 def extract(condition, arr):
-    if not isinstance(condition, Array):
-        condition = np.array(condition, dtype=bool)
+    condition = asarray(condition).astype(bool)
+    arr = asarray(arr)
     return compress(condition.ravel(), arr.ravel())
 
 
 @wraps(np.take)
 def take(a, indices, axis=0):
-    if not -a.ndim <= axis < a.ndim:
-        raise ValueError('axis=(%s) out of bounds' % axis)
-    if axis < 0:
-        axis += a.ndim
+    axis = validate_axis(axis, a.ndim)
+
     if isinstance(a, np.ndarray) and isinstance(indices, Array):
         return _take_dask_array_from_numpy(a, indices, axis)
     else:
@@ -955,10 +1046,16 @@ def around(x, decimals=0):
     return map_blocks(partial(np.around, decimals=decimals), x, dtype=x.dtype)
 
 
+def _asarray_isnull(values):
+    import pandas as pd
+    return np.asarray(pd.isnull(values))
+
+
 def isnull(values):
     """ pandas.isnull for dask arrays """
-    import pandas as pd
-    return elemwise(pd.isnull, values, dtype='bool')
+    # eagerly raise ImportError, if pandas isn't available
+    import pandas as pd  # noqa
+    return elemwise(_asarray_isnull, values, dtype='bool')
 
 
 def notnull(values):
@@ -966,9 +1063,9 @@ def notnull(values):
     return ~isnull(values)
 
 
-@wraps(numpy_compat.isclose)
+@wraps(np.isclose)
 def isclose(arr1, arr2, rtol=1e-5, atol=1e-8, equal_nan=False):
-    func = partial(numpy_compat.isclose, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    func = partial(np.isclose, rtol=rtol, atol=atol, equal_nan=equal_nan)
     return elemwise(func, arr1, arr2, dtype='bool')
 
 
@@ -1010,8 +1107,6 @@ def isnonzero(a):
 
 @wraps(np.argwhere)
 def argwhere(a):
-    from .creation import indices
-
     a = asarray(a)
 
     nz = isnonzero(a).flatten()
@@ -1063,6 +1158,46 @@ def nonzero(a):
         return (ind,)
 
 
+def _int_piecewise(x, *condlist, **kwargs):
+    return np.piecewise(
+        x, list(condlist), kwargs["funclist"],
+        *kwargs["func_args"], **kwargs["func_kw"]
+    )
+
+
+def _unravel_index_kernel(indices, func_kwargs):
+    return np.stack(np.unravel_index(indices, **func_kwargs))
+
+
+@wraps(np.unravel_index)
+def unravel_index(indices, dims, order='C'):
+    if dims and indices.size:
+        unraveled_indices = tuple(indices.map_blocks(
+            _unravel_index_kernel,
+            dtype=np.intp,
+            chunks=(((len(dims),),) + indices.chunks),
+            new_axis=0,
+            func_kwargs={"dims": dims, "order": order}
+        ))
+    else:
+        unraveled_indices = tuple(
+            empty((0,), dtype=np.intp, chunks=1) for i in dims
+        )
+
+    return unraveled_indices
+
+
+@wraps(np.piecewise)
+def piecewise(x, condlist, funclist, *args, **kw):
+    return map_blocks(
+        _int_piecewise,
+        x, *condlist,
+        dtype=x.dtype,
+        name="piecewise",
+        funclist=funclist, func_args=args, func_kw=kw
+    )
+
+
 @wraps(chunk.coarsen)
 def coarsen(reduction, x, axes, trim_excess=False):
     if (not trim_excess and
@@ -1081,7 +1216,8 @@ def coarsen(reduction, x, axes, trim_excess=False):
                    for i, bds in enumerate(x.chunks))
 
     dt = reduction(np.empty((1,) * x.ndim, dtype=x.dtype)).dtype
-    return Array(sharedict.merge(x.dask, (name, dsk)), name, chunks, dtype=dt)
+    graph = HighLevelGraph.from_collections(name, dsk, dependencies=[x])
+    return Array(graph, name, chunks, dtype=dt)
 
 
 def split_at_breaks(array, breaks, axis=0):
@@ -1101,11 +1237,7 @@ def split_at_breaks(array, breaks, axis=0):
 def insert(arr, obj, values, axis):
     # axis is a required argument here to avoid needing to deal with the numpy
     # default case (which reshapes the array to make it flat)
-    if not -arr.ndim <= axis < arr.ndim:
-        raise IndexError('axis %r is out of bounds for an array of dimension '
-                         '%s' % (axis, arr.ndim))
-    if axis < 0:
-        axis += arr.ndim
+    axis = validate_axis(axis,arr.ndim)
 
     if isinstance(obj, slice):
         obj = np.arange(*obj.indices(arr.shape[axis]))
@@ -1146,3 +1278,56 @@ def insert(arr, obj, values, axis):
     interleaved = list(interleave([split_arr, split_values]))
     interleaved = [i for i in interleaved if i.nbytes]
     return concatenate(interleaved, axis=axis)
+
+
+def _average(a, axis=None, weights=None, returned=False, is_masked=False):
+    # This was minimally modified from numpy.average
+    # See numpy license at https://github.com/numpy/numpy/blob/master/LICENSE.txt
+    # or NUMPY_LICENSE.txt within this directory
+    # Wrapper used by da.average or da.ma.average.
+    a = asanyarray(a)
+
+    if weights is None:
+        avg = a.mean(axis)
+        scl = avg.dtype.type(a.size / avg.size)
+    else:
+        wgt = asanyarray(weights)
+
+        if issubclass(a.dtype.type, (np.integer, np.bool_)):
+            result_dtype = result_type(a.dtype, wgt.dtype, 'f8')
+        else:
+            result_dtype = result_type(a.dtype, wgt.dtype)
+
+        # Sanity checks
+        if a.shape != wgt.shape:
+            if axis is None:
+                raise TypeError(
+                    "Axis must be specified when shapes of a and weights "
+                    "differ.")
+            if wgt.ndim != 1:
+                raise TypeError(
+                    "1D weights expected when shapes of a and weights differ.")
+            if wgt.shape[0] != a.shape[axis]:
+                raise ValueError(
+                    "Length of weights not compatible with specified axis.")
+
+            # setup wgt to broadcast along axis
+            wgt = broadcast_to(wgt, (a.ndim - 1) * (1,) + wgt.shape)
+            wgt = wgt.swapaxes(-1, axis)
+        if is_masked:
+            from .ma import getmaskarray
+            wgt = wgt * (~getmaskarray(a))
+        scl = wgt.sum(axis=axis, dtype=result_dtype)
+        avg = multiply(a, wgt, dtype=result_dtype).sum(axis) / scl
+
+    if returned:
+        if scl.shape != avg.shape:
+            scl = broadcast_to(scl, avg.shape).copy()
+        return avg, scl
+    else:
+        return avg
+
+
+@wraps(np.average)
+def average(a, axis=None, weights=None, returned=False):
+    return _average(a, axis, weights, returned, is_masked=False)
